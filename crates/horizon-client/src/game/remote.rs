@@ -352,6 +352,7 @@ impl Game<'_> {
     ) -> Result<()> {
         self.reset_tutorial();
         self.perf.world_opening();
+        self.lod_server = local.is_none().then(|| address.to_owned());
         let root = self.options.resources.clone();
         let builtin = Builtin::find(&root)
             .and_then(|p| Builtin::load(&p).ok())
@@ -1910,7 +1911,15 @@ impl Game<'_> {
             C::LightUpdate(p) => self.remote_light_update(&p),
             C::ForgetLevelChunk(p) => {
                 let [x, z] = p.pos;
-                self.streaming.forget(&mut self.world, x, z);
+                let drawn = self.streaming.was_meshed(x, z);
+                let chunk = self.streaming.forget(&mut self.world, x, z);
+                // The chunk's last state is what far terrain keeps of it, if
+                // it was ever drawn: a lone chunk of a view left mid-load
+                // would stand alone in the distance.
+                if let (Some(lod), Some(chunk), true) = (&mut self.lod, chunk, drawn) {
+                    self.lod_observe.remove(&(x, z));
+                    lod.observe(chunk, self.res.facts());
+                }
                 self.world
                     .block_entities
                     .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));

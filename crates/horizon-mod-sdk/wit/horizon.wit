@@ -427,8 +427,9 @@ interface render {
     /// `distance` chunks, until the next call (none ends it). The game builds
     /// it on its own workers, from the chunks already loaded or saved and,
     /// where nobody has been, from the world's generator; the simulation
-    /// distance doesn't change. Only worlds whose generator the game has
-    /// (single player and a LAN world you host) show it. The player's own LOD
+    /// distance doesn't change. On a server, whose generator the game
+    /// doesn't have, it shows the chunks the player has seen there, kept on
+    /// disk between visits. The player's own LOD
     /// Distance setting, when on, wins. One far terrain shows at a time: the
     /// first loaded mod's.
     set-far-terrain: func(far-terrain: option<far-terrain>);

@@ -246,6 +246,39 @@ impl FarDetail {
     }
 }
 
+/// Where far terrain comes from in local worlds (`FarSource` in the LOD
+/// options). Servers always draw the chunks seen there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FarSource {
+    /// Unexplored land is drawn from the world's seed (sampled, then
+    /// decorated near the player), as well as the chunks that exist.
+    #[default]
+    Generate,
+    /// Only chunks already generated: the saved ones and those loaded,
+    /// as Voxy draws. No speculative generation; unexplored land stays empty.
+    Existing,
+}
+impl FarSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            FarSource::Generate => "generate",
+            FarSource::Existing => "existing",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            FarSource::Generate => "Generate",
+            FarSource::Existing => "Existing Chunks",
+        }
+    }
+    fn parse(s: &str) -> Self {
+        if s == "existing" {
+            FarSource::Existing
+        } else {
+            FarSource::Generate
+        }
+    }
+}
 /// TAA upscaling: the world renders this much smaller than the resolution scale's size,
 /// and TAA builds the full-size picture from the jittered frames (FSR's and DLSS's ratios).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -352,6 +385,9 @@ pub struct Graphics {
     pub lod_distance: u32,
     /// How finely far terrain is drawn; Full unless the player picks Reduced.
     pub far_detail: FarDetail,
+    /// Where local worlds' far terrain comes from; Generate unless the
+    /// player picks Existing Chunks.
+    pub far_source: FarSource,
     /// Skip sections hidden behind closed ones (vanilla's occlusion graph).
     pub cave_culling: bool,
     /// Skip drawing entities hidden behind opaque terrain.
@@ -408,6 +444,7 @@ impl Default for Graphics {
             preset: Preset::Custom,
             lod_distance: 0,
             far_detail: FarDetail::Full,
+            far_source: FarSource::Generate,
             cave_culling: true,
             entity_culling: false,
             chunk_updates: 0,
@@ -469,6 +506,7 @@ impl Graphics {
                 "preset" => g.preset = Preset::parse(value),
                 "lodDistance" => g.lod_distance = number(g.lod_distance).min(1024),
                 "farDetail" => g.far_detail = FarDetail::parse(value),
+                "farTerrain" => g.far_source = FarSource::parse(value),
                 "caveCulling" => g.cave_culling = flag(g.cave_culling),
                 "entityCulling" => g.entity_culling = flag(g.entity_culling),
                 "chunkUpdates" => g.chunk_updates = number(g.chunk_updates).min(512),
@@ -524,10 +562,11 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\nfarTerrain:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
+            self.far_source.name(),
             bool_text(self.cave_culling),
             bool_text(self.entity_culling),
             self.chunk_updates,
@@ -670,6 +709,7 @@ mod tests {
             preset: Preset::Balanced,
             lod_distance: 256,
             far_detail: FarDetail::Reduced,
+            far_source: FarSource::Existing,
             cave_culling: false,
             entity_culling: true,
             chunk_updates: 12,
@@ -768,6 +808,19 @@ mod tests {
         assert_eq!(Graphics::parse("lodDistance:invalid\n").lod_distance, 0);
     }
 
+    #[test]
+    fn far_terrain_generates_unless_existing_chunks_is_picked() {
+        assert_eq!(Graphics::default().far_source, FarSource::Generate);
+        let g = Graphics::parse("farTerrain:existing\n");
+        assert_eq!(g.far_source, FarSource::Existing);
+        assert_eq!(
+            Graphics::parse(&g.serialize()).far_source,
+            FarSource::Existing
+        );
+        for text in ["farTerrain:generate\n", "farTerrain:bogus\n", ""] {
+            assert_eq!(Graphics::parse(text).far_source, FarSource::Generate);
+        }
+    }
     #[test]
     fn far_detail_is_full_unless_reduced_is_picked() {
         assert_eq!(Graphics::default().far_detail, FarDetail::Full);

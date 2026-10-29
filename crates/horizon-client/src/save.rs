@@ -3764,6 +3764,7 @@ fn decode_lod_surfaces(
         Box::new(std::array::from_fn(|_| crate::lod::Column {
             surface: None,
             spans: Vec::new(),
+            unseen: false,
         }));
     let mut water = [None; 256];
     let light = lod_light_layers(&sections, sky_light);
@@ -3939,13 +3940,88 @@ impl SaveDir {
                 .nbt(Limits::default())
                 .ok()?
         };
+        self.lod_surfaces_of(&root, assets, biomes)
+    }
+    fn lod_surfaces_of(
+        &self,
+        root: &NamedTag,
+        assets: &crate::assets::Assets,
+        biomes: &Biomes,
+    ) -> Option<LodSurfaces> {
         // Proto saves may still be missing decoration from their neighbors.
         if text(root.tag.get("Status"))
             .is_some_and(|status| status != "minecraft:full" && status != "full")
         {
             return None;
         }
-        decode_lod_surfaces(&root, assets, biomes, self.shape.sky_light)
+        decode_lod_surfaces(root, assets, biomes, self.shape.sky_light)
+    }
+}
+
+/// A local world's saved region files as far terrain's existing chunks
+/// (Far Terrain: Existing Chunks, `lod::store::ChunkImport`): each region
+/// file is read once, its finished chunks reduced to columns.
+pub struct SavedRegions {
+    pub save: Arc<SaveDir>,
+    pub assets: Arc<crate::assets::Assets>,
+    pub biomes: Arc<Biomes>,
+}
+impl crate::lod::store::ChunkImport for SavedRegions {
+    fn regions(&self) -> Vec<((i32, i32), u64)> {
+        let Ok(entries) = fs::read_dir(self.save.root.join("region")) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let mut parts = name
+                    .to_str()?
+                    .strip_prefix("r.")?
+                    .strip_suffix(".mca")?
+                    .split('.');
+                let x = parts.next()?.parse().ok()?;
+                let z = parts.next()?.parse().ok()?;
+                let modified = entry
+                    .metadata()
+                    .ok()?
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_nanos() as u64;
+                Some(((x, z), modified))
+            })
+            .collect()
+    }
+    fn region(
+        &self,
+        (rx, rz): (i32, i32),
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Vec<((i32, i32), LodSurfaces)> {
+        // One open region file for all of its chunks, not one per chunk.
+        let Ok(mut region) = RegionFile::open(self.save.region_path("region", rx, rz)) else {
+            return Vec::new();
+        };
+        let chunks: Vec<_> = region.chunks().map(|(pos, _)| pos).collect();
+        let mut columns = Vec::with_capacity(chunks.len());
+        for pos in chunks {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let Some(root) = region
+                .read(pos)
+                .ok()
+                .flatten()
+                .and_then(|record| record.nbt(Limits::default()).ok())
+            else {
+                continue;
+            };
+            if let Some(surfaces) = self.save.lod_surfaces_of(&root, &self.assets, &self.biomes) {
+                columns.push(((pos.x, pos.z), surfaces));
+            }
+        }
+        columns
     }
 }
 

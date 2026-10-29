@@ -2,7 +2,9 @@
 //! they show, in what groups, with what description and cost, and their
 //! input. How they look comes from `graphics_style`.
 use crate::{
-    graphics::{FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Upscaling},
+    graphics::{
+        FarDetail, FarSource, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Upscaling,
+    },
     graphics_style::{Cost, STYLE},
     hud::{HudAtlas, HudBatch},
     settings::{Opt, Settings},
@@ -24,6 +26,7 @@ pub enum H {
     Preset,
     LodDistance,
     FarDetail,
+    FarSource,
     CaveCulling,
     EntityCulling,
     ChunkUpdates,
@@ -103,6 +106,11 @@ pub fn rows(level: Level) -> Vec<Row> {
             "Reduced draws far terrain coarser, for GPUs it slows down."
         },
     );
+    let source = h(
+        H::FarSource,
+        Medium,
+        "Existing Chunks draws only generated chunks: less CPU, no unexplored land.",
+    );
     let fov = v(
         Opt::Fov,
         Low,
@@ -125,7 +133,7 @@ pub fn rows(level: Level) -> Vec<Row> {
         "Sets the options below together. Changing one makes it Custom.",
     );
     let mut rows = match level {
-        Level::Simple => vec![preset, render, lod, far, fov, fps, vsync, gui],
+        Level::Simple => vec![preset, render, lod, far, source, fov, fps, vsync, gui],
         Level::Hdr => vec![
             Row::Header("HDR"),
             h(
@@ -159,6 +167,7 @@ pub fn rows(level: Level) -> Vec<Row> {
             render,
             lod,
             far,
+            source,
             v(
                 Opt::SimulationDistance,
                 Medium,
@@ -399,6 +408,7 @@ impl H {
                 n => labelled("LOD Distance", format!("{n} chunks")),
             },
             H::FarDetail => labelled("Far Detail", g.far_detail.label()),
+            H::FarSource => labelled("Far Terrain", g.far_source.label()),
             H::CaveCulling => labelled("Cave Culling", on_off(g.cave_culling)),
             H::EntityCulling => labelled("Entity Culling", on_off(g.entity_culling)),
             H::ChunkUpdates => match g.chunk_updates {
@@ -512,6 +522,13 @@ impl H {
             }
             H::FarDetail => {
                 g.far_detail = step(&[FarDetail::Full, FarDetail::Reduced], g.far_detail, back)
+            }
+            H::FarSource => {
+                g.far_source = step(
+                    &[FarSource::Generate, FarSource::Existing],
+                    g.far_source,
+                    back,
+                )
             }
             H::CaveCulling => g.cave_culling = !g.cave_culling,
             H::EntityCulling => g.entity_culling = !g.entity_culling,

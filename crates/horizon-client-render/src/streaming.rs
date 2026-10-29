@@ -124,6 +124,15 @@ pub trait LodSampler: Send {
 }
 pub trait LodSource: Send + Sync {
     fn sampler(self: Arc<Self>) -> Box<dyn LodSampler>;
+    /// A visited chunk's columns, summarized on the far-terrain worker: a
+    /// source that keeps them (`lod::store::StoreSource`) draws them later.
+    fn remember(&self, _chunk: (i32, i32), _columns: &[crate::lod::Column; 256]) {}
+    /// Whether `remember` keeps what it is given: far terrain then hands it
+    /// every drawn chunk at once, and saves what is still queued when it
+    /// stops (`Lod::keeps`).
+    fn keeps(&self) -> bool {
+        false
+    }
 }
 struct GeneratorSampler<G: ChunkGenerator> {
     generator: Arc<G>,
@@ -718,6 +727,12 @@ impl Streaming {
         }
     }
     /// A column the server unloaded (ClientboundForgetLevelChunkPacket).
+    /// Whether the column was meshed for drawing (its neighbours were all
+    /// there and lit): far terrain keeps only such columns of a server, not
+    /// the stragglers at the edge of a view the player left mid-load.
+    pub fn was_meshed(&self, x: i32, z: i32) -> bool {
+        self.meshed.contains(&(x, z))
+    }
     pub fn forget(&mut self, world: &mut World, x: i32, z: i32) -> Option<Arc<Chunk>> {
         self.lit.remove(&(x, z));
         self.meshed.remove(&(x, z));

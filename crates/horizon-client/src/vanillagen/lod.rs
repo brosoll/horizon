@@ -25,7 +25,7 @@ mod vegetation;
 use islands::EndIslands;
 use vegetation::Vegetation;
 const CACHE: usize = 1024;
-const REQUESTS: usize = 64;
+const REQUESTS: usize = 256;
 const BATCH: i32 = 4;
 fn batch_origin((x, z): (i32, i32)) -> (i32, i32) {
     (x.div_euclid(BATCH) * BATCH, z.div_euclid(BATCH) * BATCH)
@@ -34,7 +34,8 @@ fn batch_origin((x, z): (i32, i32)) -> (i32, i32) {
 struct Requests {
     chunks: FxHashSet<(i32, i32)>,
     center: [i32; 2],
-    current: Option<(i32, i32)>,
+    /// The batches the workers are decorating.
+    current: FxHashSet<(i32, i32)>,
     finished: FxHashSet<(i32, i32)>,
 }
 struct Shared {
@@ -47,10 +48,40 @@ fn distance((x, z): (i32, i32), center: [i32; 2]) -> i64 {
     let dz = i64::from(z * 16 + 8 - center[1]);
     dx * dx + dz * dz
 }
+/// `column_kinds` bits.
+const KEPT: u8 = 1;
+const FLUID: u8 = 2;
+const LAVA: u8 = 4;
+/// What `columns` needs of each block state, read once: looking every
+/// block's name up made converting a decorated chunk slow.
+fn column_kinds(data: &horizon_world::worldgen::generator::GeneratorData) -> Vec<u8> {
+    let registry = data.registry();
+    let states = data.block_states();
+    (0..registry.len())
+        .map(|i| {
+            let state = BlockStateId(i as u32);
+            let properties = states.get(state);
+            let name = registry.state(state).map_or("", |s| s.name.as_str());
+            let kept = !properties.is_air()
+                && (properties.blocks_motion_in_heightmap()
+                    || properties.has_fluid()
+                    || matches!(name, "minecraft:chorus_plant" | "minecraft:chorus_flower"));
+            (u8::from(kept) * KEPT)
+                | (u8::from(matches!(name, "minecraft:water" | "minecraft:lava")) * FLUID)
+                | (u8::from(name == "minecraft:lava") * LAVA)
+        })
+        .collect()
+}
+/// Decoration workers for `threads` hardware threads: each holds its own
+/// generator (structure placement flags are one-shot) and a batch's proto
+/// chunks, tens of MiB.
+fn decoration_threads(threads: usize) -> usize {
+    (threads / 4).clamp(1, 3)
+}
 struct Builder {
     shared: Arc<Shared>,
     results: mpsc::Receiver<LodDetail>,
-    thread: Option<thread::JoinHandle<()>>,
+    threads: Vec<thread::JoinHandle<()>>,
 }
 impl Builder {
     fn new(terrain: Arc<VanillaTerrain>) -> Self {
@@ -59,75 +90,26 @@ impl Builder {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
         });
-        let worker = shared.clone();
         let (tx, results) = mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("Far decoration".into())
-            .spawn(move || {
-                // Structure pieces have mutable one-shot placement flags. Sharing
-                // gameplay's seeded pipeline would consume its chests/spawners.
-                let generator = match OverworldGenerator::for_dimension(
-                    terrain.generator.data().clone(),
-                    terrain.seed,
-                    &terrain.preset,
-                    &terrain.dimension,
-                ) {
-                    Ok(generator) => generator,
-                    Err(error) => {
-                        log::warn!("Horizon: far decoration unavailable: {error}");
-                        worker.stop.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                };
-                let mut state = generator.worker();
-                loop {
-                    let key = {
-                        let mut requests = worker.requests.lock().unwrap();
-                        while requests.chunks.is_empty() && !worker.stop.load(Ordering::Relaxed) {
-                            requests = worker.wake.wait(requests).unwrap();
-                        }
-                        if worker.stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let key = *requests
-                            .chunks
-                            .iter()
-                            .min_by_key(|&&key| (distance(key, requests.center), key))
-                            .unwrap();
-                        let origin = batch_origin(key);
-                        requests.chunks.retain(|&key| batch_origin(key) != origin);
-                        requests.current = Some(origin);
-                        origin
-                    };
-                    let result = decorated_batch(&mut state, key, BATCH, &worker.stop, |chunk| {
-                        let pos = chunk.position();
-                        let key = (pos.x, pos.z);
-                        worker.requests.lock().unwrap().finished.insert(key);
-                        let columns = columns(chunk, &terrain.biome_map, &terrain.dimension);
-                        if tx.send((key, columns)).is_err() {
-                            worker.stop.store(true, Ordering::Relaxed);
-                        }
-                    });
-                    worker.requests.lock().unwrap().current = None;
-                    match result {
-                        Ok(_) => {}
-                        Err(error) => {
-                            log::warn!(
-                                "Horizon: far decoration failed at {} {}: {error}",
-                                key.0,
-                                key.1
-                            );
-                            worker.stop.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                }
+        let kinds = Arc::new(column_kinds(terrain.generator.data()));
+        let count = decoration_threads(thread::available_parallelism().map_or(1, |n| n.get()));
+        let threads = (0..count)
+            .filter_map(|_| {
+                let worker = shared.clone();
+                let terrain = terrain.clone();
+                let tx = tx.clone();
+                let kinds = kinds.clone();
+                thread::Builder::new()
+                    .name("Far decoration".into())
+                    .spawn(move || decorate_requests(&terrain, &worker, &tx, &kinds))
+                    .map_err(|e| log::warn!("Horizon: far decoration worker: {e}"))
+                    .ok()
             })
-            .expect("far decoration worker");
+            .collect();
         Self {
             shared,
             results,
-            thread: Some(thread),
+            threads,
         }
     }
     fn request(&self, chunks: &[(i32, i32)], center: [i32; 2]) {
@@ -137,7 +119,7 @@ impl Builder {
         let mut requests = self.shared.requests.lock().unwrap();
         requests.center = center;
         for &key in chunks {
-            if requests.current != Some(batch_origin(key)) && !requests.finished.contains(&key) {
+            if !requests.current.contains(&batch_origin(key)) && !requests.finished.contains(&key) {
                 requests.chunks.insert(key);
             }
         }
@@ -146,14 +128,84 @@ impl Builder {
             sorted.sort_unstable_by_key(|&key| (distance(key, center), key));
             requests.chunks = sorted.into_iter().take(REQUESTS).collect();
         }
-        self.shared.wake.notify_one();
+        self.shared.wake.notify_all();
+    }
+}
+/// One decoration worker: the nearest requested batch no other worker has.
+fn decorate_requests(
+    terrain: &VanillaTerrain,
+    worker: &Shared,
+    tx: &mpsc::Sender<LodDetail>,
+    kinds: &[u8],
+) {
+    // Structure pieces have mutable one-shot placement flags. Sharing
+    // gameplay's seeded pipeline would consume its chests/spawners.
+    let generator = match OverworldGenerator::for_dimension(
+        terrain.generator.data().clone(),
+        terrain.seed,
+        &terrain.preset,
+        &terrain.dimension,
+    ) {
+        Ok(generator) => generator,
+        Err(error) => {
+            log::warn!("Horizon: far decoration unavailable: {error}");
+            worker.stop.store(true, Ordering::Relaxed);
+            worker.wake.notify_all();
+            return;
+        }
+    };
+    let mut state = generator.worker();
+    loop {
+        let key = {
+            let mut requests = worker.requests.lock().unwrap();
+            loop {
+                if worker.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let center = requests.center;
+                let current = &requests.current;
+                if let Some(&key) = requests
+                    .chunks
+                    .iter()
+                    .filter(|&&key| !current.contains(&batch_origin(key)))
+                    .min_by_key(|&&key| (distance(key, center), key))
+                {
+                    let origin = batch_origin(key);
+                    requests.chunks.retain(|&key| batch_origin(key) != origin);
+                    requests.current.insert(origin);
+                    break origin;
+                }
+                requests = worker.wake.wait(requests).unwrap();
+            }
+        };
+        let result = decorated_batch(&mut state, key, BATCH, &worker.stop, |chunk| {
+            let pos = chunk.position();
+            let key = (pos.x, pos.z);
+            worker.requests.lock().unwrap().finished.insert(key);
+            let columns = columns(chunk, &terrain.biome_map, &terrain.dimension, kinds);
+            if tx.send((key, columns)).is_err() {
+                worker.stop.store(true, Ordering::Relaxed);
+            }
+        });
+        worker.requests.lock().unwrap().current.remove(&key);
+        worker.wake.notify_all();
+        if let Err(error) = result {
+            log::warn!(
+                "Horizon: far decoration failed at {} {}: {error}",
+                key.0,
+                key.1
+            );
+            worker.stop.store(true, Ordering::Relaxed);
+            worker.wake.notify_all();
+            return;
+        }
     }
 }
 impl Drop for Builder {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
-        self.shared.wake.notify_one();
-        if let Some(thread) = self.thread.take() {
+        self.shared.wake.notify_all();
+        for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
     }
@@ -232,9 +284,13 @@ fn decorated_region(
 ) -> Result<Option<ProtoChunk>, GeneratorError> {
     Ok(decorated_batch(worker, center, 1, stop, |_| {})?.remove(&center))
 }
-fn columns(chunk: &ProtoChunk, biome_map: &[u16], dimension: &str) -> Arc<[Column; 256]> {
-    let states = chunk.data().block_states();
-    let registry = chunk.data().registry();
+/// `kinds`: `column_kinds`, per block state.
+fn columns(
+    chunk: &ProtoChunk,
+    biome_map: &[u16],
+    dimension: &str,
+    kinds: &[u8],
+) -> Arc<[Column; 256]> {
     let min = chunk.terrain.min_y().max(MIN_Y);
     let max = (chunk.terrain.min_y() + chunk.terrain.height()).min(MIN_Y + HEIGHT);
     Arc::new(std::array::from_fn(|index| {
@@ -243,16 +299,11 @@ fn columns(chunk: &ProtoChunk, biome_map: &[u16], dimension: &str) -> Arc<[Colum
         let mut column = Column::default();
         for y in min..max {
             let state = chunk.block(x, y, z);
-            let properties = states.get(state);
-            let name = registry.state(state).map_or("", |s| s.name.as_str());
-            if properties.is_air()
-                || (!properties.blocks_motion_in_heightmap()
-                    && !properties.has_fluid()
-                    && !matches!(name, "minecraft:chorus_plant" | "minecraft:chorus_flower"))
-            {
+            let kind = kinds.get(state.0 as usize).copied().unwrap_or(0);
+            if kind & KEPT == 0 {
                 continue;
             }
-            let fluid = matches!(name, "minecraft:water" | "minecraft:lava");
+            let fluid = kind & FLUID != 0;
             let biome = biome_map
                 .get(chunk.biome_id_at(x, y, z).0 as usize)
                 .copied()
@@ -263,11 +314,7 @@ fn columns(chunk: &ProtoChunk, biome_map: &[u16], dimension: &str) -> Arc<[Colum
                 0
             } else {
                 240
-            } | if name == "minecraft:lava" {
-                15 << 12
-            } else {
-                0
-            };
+            } | if kind & LAVA != 0 { 15 << 12 } else { 0 };
             column.push(Span {
                 min: y as i16,
                 max: (y + 1) as i16,
@@ -455,6 +502,7 @@ impl VanillaLodSampler {
         let mut column = Column {
             surface,
             spans: Vec::new(),
+            unseen: false,
         };
         for (min, max, state) in spans.into_iter().rev() {
             column.push(Span {
@@ -697,7 +745,12 @@ mod tests {
                 emitted
                     .insert(
                         (pos.x, pos.z),
-                        columns(chunk, &terrain.biome_map, "minecraft:overworld")
+                        columns(
+                            chunk,
+                            &terrain.biome_map,
+                            "minecraft:overworld",
+                            &column_kinds(terrain.generator.data())
+                        )
                     )
                     .is_none()
             );
@@ -711,7 +764,12 @@ mod tests {
         for (key, data) in emitted {
             assert_eq!(
                 data,
-                columns(&region[&key], &terrain.biome_map, "minecraft:overworld"),
+                columns(
+                    &region[&key],
+                    &terrain.biome_map,
+                    "minecraft:overworld",
+                    &column_kinds(terrain.generator.data())
+                ),
                 "emitted before all neighbouring features completed"
             );
         }
@@ -738,7 +796,12 @@ mod tests {
             )?;
             assert_eq!(emitted, (BATCH * BATCH) as usize);
             let chunk = region.remove(&center).unwrap();
-            let data = columns(&chunk, &terrain.biome_map, dimension);
+            let data = columns(
+                &chunk,
+                &terrain.biome_map,
+                dimension,
+                &column_kinds(terrain.generator.data()),
+            );
             if dimension == "minecraft:the_nether" {
                 assert!(
                     data.iter()
@@ -774,7 +837,12 @@ mod tests {
                     .iter()
                     .any(|(name, _, _, _)| name.contains("bastion"))
             );
-            let data = columns(&chunk, &terrain.biome_map, "minecraft:the_nether");
+            let data = columns(
+                &chunk,
+                &terrain.biome_map,
+                "minecraft:the_nether",
+                &column_kinds(terrain.generator.data()),
+            );
             let snapshot = (data, chunk.block_entities);
             if let Some(previous) = &previous {
                 assert_eq!(
@@ -927,14 +995,17 @@ mod tests {
                     }
                 }
             }
-            let kept: usize = columns(&chunk, &terrain.biome_map, "minecraft:the_end")
-                .iter()
-                .flat_map(|column| &column.spans)
-                .filter(|span| {
-                    assets.registry.state(span.state).unwrap().name == "minecraft:end_stone"
-                })
-                .map(|span| (span.max - span.min) as usize)
-                .sum();
+            let kept: usize = columns(
+                &chunk,
+                &terrain.biome_map,
+                "minecraft:the_end",
+                &column_kinds(terrain.generator.data()),
+            )
+            .iter()
+            .flat_map(|column| &column.spans)
+            .filter(|span| assets.registry.state(span.state).unwrap().name == "minecraft:end_stone")
+            .map(|span| (span.max - span.min) as usize)
+            .sum();
             assert_eq!(
                 raw, kept,
                 "far columns keep the real small island in {cx} {cz}"
@@ -1003,12 +1074,17 @@ mod tests {
                 if raw == 0 {
                     continue;
                 }
-                let kept: usize = columns(&chunk, &terrain.biome_map, "minecraft:the_end")
-                    .iter()
-                    .flat_map(|column| &column.spans)
-                    .filter(|span| chorus(span.state))
-                    .map(|span| (span.max - span.min) as usize)
-                    .sum();
+                let kept: usize = columns(
+                    &chunk,
+                    &terrain.biome_map,
+                    "minecraft:the_end",
+                    &column_kinds(terrain.generator.data()),
+                )
+                .iter()
+                .flat_map(|column| &column.spans)
+                .filter(|span| chorus(span.state))
+                .map(|span| (span.max - span.min) as usize)
+                .sum();
                 assert_eq!(
                     raw, kept,
                     "far columns keep every real chorus block in {cx} {cz}"

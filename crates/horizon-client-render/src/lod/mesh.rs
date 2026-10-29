@@ -11,6 +11,12 @@ use horizon_world::registry::BlockStateId;
 use std::collections::BTreeMap;
 
 const CELLS: usize = 16;
+/// How far below a column's top its sides reach where they face a place
+/// nobody has seen (`Column::unseen`), in blocks; at least a cell. A wall
+/// down to the world's floor there made each lone chunk at the edge of the
+/// explored area a pillar; a skirt this deep still closes the view under the
+/// terrain from above.
+pub(super) const UNSEEN_SKIRT: i32 = 16;
 
 pub(super) struct EdgeColumn {
     pub start: i32,
@@ -367,6 +373,14 @@ fn mesh_columns_with_edges(
                 .collect()
         })
         .collect();
+    // `prepared`'s columns that nobody has seen: their neighbours' sides
+    // only skirt them (`UNSEEN_SKIRT`).
+    let unseen: Vec<bool> = columns
+        .iter()
+        .chain(neighbors.iter().flatten().map(|edge| &edge.column))
+        .map(|column| column.unseen)
+        .collect();
+    let skirt = UNSEEN_SKIRT.max(stride) as f32;
     let mut faces = Faces::new();
     let finer_keys: FxHashSet<_> = finer.iter().copied().collect();
     let mut finer_levels: Vec<_> = finer.iter().map(|key| key.level).collect();
@@ -389,6 +403,7 @@ fn mesh_columns_with_edges(
             let step = cell_step(x, z);
             let column = &prepared[z * CELLS + x];
             let own_sky = column.last().map_or(0, |top| top.span.light & 0xff);
+            let skirt_floor = column.last().map_or(0.0, |top| top.max) - skirt;
             for dz in (0..stride).step_by(step as usize) {
                 for dx in (0..stride).step_by(step as usize) {
                     if is_covered(wx + dx, wz + dz) {
@@ -473,6 +488,14 @@ fn mesh_columns_with_edges(
                             let side = material(segment.span, direction);
                             // Near meshes may have culled against the real neighbor.
                             // Keep a finite seal where their full-detail area begins.
+                            // Facing an unseen place: only a skirt (`UNSEEN_SKIRT`).
+                            let beside = |index: usize| {
+                                if unseen[index] {
+                                    (&[][..], skirt_floor)
+                                } else {
+                                    (&prepared[index][..], f32::NEG_INFINITY)
+                                }
+                            };
                             if is_covered(nw[0], nw[1]) {
                                 add_side(
                                     &mut faces,
@@ -484,15 +507,9 @@ fn mesh_columns_with_edges(
                                     &[],
                                     side,
                                     own_sky,
+                                    f32::NEG_INFINITY,
                                 );
                             } else if !edge {
-                                add_side(
-                                    &mut faces, direction, plane, u0, u1, segment, column, side,
-                                    own_sky,
-                                );
-                            } else if (0..CELLS as i32).contains(&nx)
-                                && (0..CELLS as i32).contains(&nz)
-                            {
                                 add_side(
                                     &mut faces,
                                     direction,
@@ -500,9 +517,18 @@ fn mesh_columns_with_edges(
                                     u0,
                                     u1,
                                     segment,
-                                    &prepared[nz as usize * CELLS + nx as usize],
+                                    column,
                                     side,
                                     own_sky,
+                                    f32::NEG_INFINITY,
+                                );
+                            } else if (0..CELLS as i32).contains(&nx)
+                                && (0..CELLS as i32).contains(&nz)
+                            {
+                                let (neighbor, floor) = beside(nz as usize * CELLS + nx as usize);
+                                add_side(
+                                    &mut faces, direction, plane, u0, u1, segment, neighbor, side,
+                                    own_sky, floor,
                                 );
                             } else {
                                 let edge_side = match direction {
@@ -523,6 +549,7 @@ fn mesh_columns_with_edges(
                                         &[],
                                         side,
                                         own_sky,
+                                        f32::NEG_INFINITY,
                                     );
                                 }
                                 // A coarse face can meet several finer columns.
@@ -531,16 +558,10 @@ fn mesh_columns_with_edges(
                                     let start = u0.max(edge.start as f32);
                                     let end = u1.min(edge.end as f32);
                                     if start < end {
+                                        let (neighbor, floor) = beside(edge_offsets[edge_side] + i);
                                         add_side(
-                                            &mut faces,
-                                            direction,
-                                            plane,
-                                            start,
-                                            end,
-                                            segment,
-                                            &prepared[edge_offsets[edge_side] + i],
-                                            side,
-                                            own_sky,
+                                            &mut faces, direction, plane, start, end, segment,
+                                            neighbor, side, own_sky, floor,
                                         );
                                     }
                                 }
@@ -586,7 +607,8 @@ mod refinement_tests {
                     state: BlockStateId(1),
                     biome: 0,
                     light: 240,
-                }]
+                }],
+                unseen: false,
             };
             256
         ];
@@ -650,9 +672,14 @@ mod refinement_tests {
 /// with the material below them, or the fluid above them (kelp and seagrass
 /// leave gaps in water): a cave seen from nowhere adds no faces. A
 /// gap is open when a neighbouring column's top lies below the gap's top, so
-/// that column's open air looks into it. Unknown neighbours, and cells that
-/// `whole` rejects (they meet full-detail or finer terrain), count as open;
-/// those cells keep their gaps.
+/// that column's open air looks into it, and open air spreads on from there
+/// through the gaps of neighbouring cells it overlaps: the air under a tree's
+/// canopy is open all the way in, not only at the canopy's rim (filling it
+/// stood a pillar of ground under every distant canopy). Unknown neighbours,
+/// and cells that `whole` rejects (they meet full-detail or finer terrain),
+/// count as open; those cells keep their gaps. Unseen places
+/// (`Column::unseen`) count as closed: the sides facing them are only skirts,
+/// which must not open caves.
 fn fill_buried_gaps<'a>(
     columns: &'a [Column],
     neighbors: &[Vec<EdgeColumn>; 4],
@@ -671,7 +698,9 @@ fn fill_buried_gaps<'a>(
     };
     let tops: Vec<_> = (0..CELLS * CELLS)
         .map(|i| {
-            if whole(i % CELLS, i / CELLS) {
+            if columns[i].unseen {
+                i16::MAX
+            } else if whole(i % CELLS, i / CELLS) {
                 top(&columns[i])
             } else {
                 i16::MIN
@@ -683,46 +712,81 @@ fn fill_buried_gaps<'a>(
         neighbors[side]
             .iter()
             .filter(|edge| edge.start < end && start < edge.end)
-            .map(|edge| top(&edge.column))
+            .map(|edge| {
+                if edge.column.unseen {
+                    i16::MAX
+                } else {
+                    top(&edge.column)
+                }
+            })
             .min()
             .unwrap_or(i16::MIN)
     };
-    columns
+    let beside = |i: usize| {
+        let (x, z) = (i % CELLS, i / CELLS);
+        [
+            (x > 0).then(|| i - 1),
+            (x + 1 < CELLS).then(|| i + 1),
+            (z > 0).then(|| i - CELLS),
+            (z + 1 < CELLS).then(|| i + CELLS),
+        ]
+    };
+    // Each whole cell's gaps, bottom and top, and whether open air reaches
+    // them: first from a lower neighbouring top.
+    let mut gaps: Vec<Vec<(i16, i16, bool)>> = columns
         .iter()
         .enumerate()
         .map(|(i, column)| {
             let (x, z) = (i % CELLS, i / CELLS);
             if column.spans.len() < 2 || !whole(x, z) {
-                return Cow::Borrowed(column);
+                return Vec::new();
             }
+            let [west, east, north, south] = beside(i);
             let open = [
-                if x > 0 { tops[i - 1] } else { edge(0, z) },
-                if x + 1 < CELLS {
-                    tops[i + 1]
-                } else {
-                    edge(1, z)
-                },
-                if z > 0 { tops[i - CELLS] } else { edge(2, x) },
-                if z + 1 < CELLS {
-                    tops[i + CELLS]
-                } else {
-                    edge(3, x)
-                },
+                west.map_or_else(|| edge(0, z), |n| tops[n]),
+                east.map_or_else(|| edge(1, z), |n| tops[n]),
+                north.map_or_else(|| edge(2, x), |n| tops[n]),
+                south.map_or_else(|| edge(3, x), |n| tops[n]),
             ]
             .into_iter()
             .min()
             .unwrap_or(i16::MIN);
-            let buried = |below: &Span, above: &Span| below.max < above.min && above.min <= open;
-            if !column
+            column
                 .spans
                 .windows(2)
-                .any(|pair| buried(&pair[0], &pair[1]))
-            {
+                .filter(|pair| pair[0].max < pair[1].min)
+                .map(|pair| (pair[0].max, pair[1].min, pair[1].min > open))
+                .collect()
+        })
+        .collect();
+    // Then on, through the overlapping gaps of neighbouring cells.
+    let mut reached: Vec<(usize, usize)> = (0..gaps.len())
+        .flat_map(|i| (0..gaps[i].len()).map(move |g| (i, g)))
+        .filter(|&(i, g)| gaps[i][g].2)
+        .collect();
+    while let Some((i, g)) = reached.pop() {
+        let (bottom, top, _) = gaps[i][g];
+        for n in beside(i).into_iter().flatten() {
+            for (k, gap) in gaps[n].iter_mut().enumerate() {
+                if !gap.2 && gap.0.max(bottom) < gap.1.min(top) {
+                    gap.2 = true;
+                    reached.push((n, k));
+                }
+            }
+        }
+    }
+    columns
+        .iter()
+        .zip(&gaps)
+        .map(|(column, gaps)| {
+            let buried = |below: &Span, above: &Span| gaps.contains(&(below.max, above.min, false));
+            if gaps.iter().all(|gap| gap.2) {
                 return Cow::Borrowed(column);
             }
             let mut filled = Column {
                 surface: column.surface,
                 spans: Vec::with_capacity(column.spans.len()),
+                unseen: column.unseen,
             };
             for &span in &column.spans {
                 let mut span = span;
@@ -757,6 +821,7 @@ fn add_side(
     neighbor: &[Segment<'_>],
     side: Material,
     own_sky: u16,
+    floor: f32,
 ) {
     let (open, sky) = neighbor.last().map_or((f32::NEG_INFINITY, own_sky), |top| {
         (f32::from(top.span.max), top.span.light & 0xff)
@@ -773,7 +838,7 @@ fn add_side(
             }
         }
     };
-    let mut floor = segment.min;
+    let mut floor = segment.min.max(floor);
     for next in neighbor {
         if next.max <= floor
             || next.min >= segment.max
@@ -916,6 +981,7 @@ mod tests {
             .map(|_| Column {
                 surface: None,
                 spans: Vec::new(),
+                unseen: false,
             })
             .collect()
     }
@@ -1048,6 +1114,111 @@ mod tests {
                 .iter()
                 .any(|q| q.iter().all(|v| v.pos[1] == 8.0) && normal(q).y < 0.0)
         );
+    }
+    /// The lowest point of the side faces (normal across x or z).
+    fn lowest_side(mesh: &SectionMesh) -> f32 {
+        mesh.solid
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|q| normal(q).y == 0.0)
+            .flat_map(|q| q.iter().map(|v| v.pos[1]))
+            .fold(f32::INFINITY, f32::min)
+    }
+    #[test]
+    fn sides_facing_unseen_places_are_skirts_and_empty_air_keeps_walls() {
+        let mut columns = columns();
+        columns[17].spans = vec![span(-64, 70, 1)];
+        // Next to empty air (the End's void): walls to the bottom.
+        assert_eq!(lowest_side(&mesh(&columns)), -64.0);
+        // Next to places nobody has seen: a skirt below its top.
+        for (i, column) in columns.iter_mut().enumerate() {
+            column.unseen = i != 17;
+        }
+        let mesh = mesh(&columns);
+        assert_eq!(lowest_side(&mesh), (70 - UNSEEN_SKIRT) as f32);
+        let sides = mesh
+            .solid
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|q| normal(q).y == 0.0)
+            .count();
+        assert_eq!(sides, 4);
+        // A seen neighbour still gets the full wall above it.
+        columns[18].unseen = false;
+        columns[18].spans = vec![span(-64, 0, 1)];
+        let east: Vec<_> = mesh_columns(
+            TileKey {
+                x: 0,
+                z: 0,
+                level: 0,
+            },
+            &columns,
+            &FxHashSet::default(),
+            None,
+            material,
+        )
+        .solid
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|q| normal(q).x > 0.0 && q.iter().all(|v| v.pos[0] == 2.0))
+        .flat_map(|q| q.iter().map(|v| v.pos[1]))
+        .collect();
+        assert_eq!(east.iter().copied().fold(f32::INFINITY, f32::min), 0.0);
+    }
+    #[test]
+    fn the_air_under_a_wide_canopy_stays_open_all_the_way_in() {
+        let mut columns = columns();
+        for (i, column) in columns.iter_mut().enumerate() {
+            let (x, z) = (i % CELLS, i / CELLS);
+            column.spans = vec![span(0, 64, 1)];
+            if (5..11).contains(&x) && (5..11).contains(&z) {
+                column.spans.push(span(70, 72, 3));
+            }
+        }
+        let mesh = mesh(&columns);
+        // Filled, the inner cells were pillars of ground up to the leaves:
+        // walls between the ground and the canopy.
+        assert!(
+            !mesh
+                .solid
+                .iter()
+                .any(|v| v.pos[1] > 64.0 && v.pos[1] < 70.0),
+            "ground walls under the canopy"
+        );
+        // The canopy's underside is drawn in full, inner cells included.
+        let underside: f32 = mesh
+            .solid
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|q| q.iter().all(|v| v.pos[1] == 70.0) && normal(q).y < 0.0)
+            .map(|q| -normal(q).y)
+            .sum();
+        assert_eq!(underside, 36.0);
+    }
+    #[test]
+    fn caves_beside_unseen_places_stay_closed() {
+        let mut columns = columns();
+        for column in &mut columns {
+            column.unseen = true;
+        }
+        columns[17] = Column {
+            surface: None,
+            spans: vec![span(-64, 10, 1), span(20, 70, 1)],
+            unseen: false,
+        };
+        let mesh = mesh(&columns);
+        // No floor or ceiling of the cave: it was filled.
+        assert!(
+            !mesh
+                .solid
+                .iter()
+                .any(|v| v.pos[1] == 10.0 || v.pos[1] == 20.0)
+        );
+        assert_eq!(lowest_side(&mesh), (70 - UNSEEN_SKIRT) as f32);
     }
     #[test]
     fn neighbor_hides_only_its_occupied_side_intervals() {
@@ -1242,6 +1413,7 @@ mod tests {
                 column: Column {
                     surface: None,
                     spans: vec![span(0, 8, 1)],
+                    unseen: false,
                 },
             },
             EdgeColumn {

@@ -316,7 +316,7 @@ CHECKS = ['tab', 'self', 'armour', 'nametags', 'walls', 'chest', 'crafting', 'sp
           'enchanting', 'beacon', 'crafter', 'lectern', 'cartography', 'trials', 'clicks', 'sleep', 'sleep-villager', 'bed-occupied', 'sleep-reload', 'predict', 'push',
           'piston-push', 'piston-slime', 'eat', 'eating', 'xp', 'objects', 'projectiles', 'thrown', 'sparks', 'hud', 'sidebar', 'border', 'particles',
           'worn', 'blast', 'barter', 'deflect', 'fireball', 'light', 'time', 'swings', 'cracks', 'plates', 'effects',
-          'portals', 'distance', 'growth', 'doors', 'flight', 'ladder', 'boats', 'minecarts', 'frames', 'hands',
+          'portals', 'distance', 'far', 'growth', 'doors', 'flight', 'ladder', 'boats', 'minecarts', 'frames', 'hands',
           'lightning', 'riding', 'occupied_horse', 'mounts', 'worldspawn', 'beds', 'shield', 'deathmining', 'contacts', 'absorption',
           'breath', 'lava', 'levels', 'drops', 'underwater', 'fireworks']
 
@@ -688,6 +688,52 @@ def check_distance(host, guest, out):
     assert seen[6][0] == 6, f'the host at 6 streams {seen[6][0]} chunks out (all: {seen})'
     assert seen[6][1] == 7, f'the guest streams {seen[6][1]} with the server at 6 (all: {seen})'
     return seen
+
+
+def check_far(host, guest, out):
+    """Far terrain on a server (lod::store): a guest has no generator, so LOD Distance draws the chunks it has
+    seen, kept on disk per server and dimension, and still there after it leaves and comes back."""
+    def lod(game):
+        return game('status')['lod']
+
+    def stored():
+        return sorted(p for p in guest.work.rglob('lod/*/minecraft_overworld/r.*.lod'))
+
+    try:
+        guest.raw('lod-distance', 64)
+        x, y, z = (int(v // 1) for v in pos_of(guest))
+        # A short walk through new chunks, so some leave the guest's view (ForgetLevelChunk) on the way.
+        for step in range(1, 4):
+            guest('command', command=f'tp @s {x + step * 160} 200 {z}')
+            guest.wait(60)
+        seen = guest.until(lambda: lod(guest), lambda l: l['source'] == 'server' and l['active_tiles'] > 0,
+                           ticks=200)
+        # Over the start, looking back along the walk: past the render distance only far terrain is drawn.
+        guest.raw('render-distance', 6)
+        guest('command', command='gamemode spectator')
+        guest('command', command=f'tp @s {x} 160 {z} -90 12')
+        guest.wait(60)
+        guest.shot(out, 'far')
+        guest('command', command=f'tp @s {x} {y} {z}')
+        files = stored()
+        assert files, f'the guest kept no far terrain: {seen}'
+        port = host.raw('lan', 'status')['port']
+        guest.raw('disconnect')
+        time.sleep(2)
+        guest.raw('connect', f'127.0.0.1:{port}', GUEST_NAME)
+        guest.raw('wait-for', 'loaded', '--timeout', 300)
+        again = guest.until(lambda: lod(guest), lambda l: l['source'] == 'server' and l['active_tiles'] > 0,
+                            ticks=200)
+        # The same view, now only from what was kept on disk.
+        guest('command', command='gamemode spectator')
+        guest('command', command=f'tp @s {x} 160 {z} -90 12')
+        guest.wait(200)
+        guest.shot(out, 'far-rejoined')
+        return {'first': seen, 'rejoined': again, 'files': len(files)}
+    finally:
+        guest.raw('lod-distance', 0)
+        guest.raw('render-distance', 12)
+        guest('command', command='gamemode survival')
 
 
 def check_portals(host, guest, out):
@@ -5299,7 +5345,7 @@ CHECK_FNS = {'tab': check_tab, 'self': check_self, 'armour': check_armour,
              'beacon': check_beacon, 'crafter': check_crafter, 'lectern': check_lectern,
              'cartography': check_cartography, 'hurt': check_hurt, 'commands': check_commands,
              'recipes': check_recipes, 'trials': check_trials, 'walls': check_walls,
-             'effects': check_effects, 'portals': check_portals, 'distance': check_distance,
+             'effects': check_effects, 'portals': check_portals, 'distance': check_distance, 'far': check_far,
              'clicks': check_clicks, 'sleep': check_sleep, 'sleep-villager': check_sleep_villager,
              'bed-occupied': check_bed_occupied, 'sleep-reload': check_sleep_reload,
              'push': check_push, 'piston-push': check_piston_push,

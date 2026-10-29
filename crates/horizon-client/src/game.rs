@@ -1472,6 +1472,12 @@ struct Game<'a> {
     streaming: Streaming,
     lod: Option<horizon_client::lod::Lod>,
     lod_source_attempted: bool,
+    /// The server this window last joined (`join_server`): its seen chunks
+    /// are far terrain's store (`remote_lod_source`).
+    lod_server: Option<String>,
+    /// Whether far terrain was started from existing chunks only (Far
+    /// Terrain: Existing Chunks): a change of the setting starts it again.
+    lod_existing: bool,
     lod_observe: horizon_client::fast_hash::FxHashSet<(i32, i32)>,
     /// Beacon beam sections kept after their chunk unloads, so far terrain
     /// LOD still draws their beams (`beacon_geometry` refreshes them).
@@ -12846,19 +12852,30 @@ impl Game<'_> {
             && self.renderer.is_some()
             && self.player.is_some()
             && self.title.is_none()
-            && (self.remote.is_none() || self.integrated.is_some());
+            && (self.remote.is_none() || self.integrated.is_some() || self.lod_server.is_some());
         if !enabled {
             if self.lod.is_some() || self.lod_source_attempted {
                 self.clear_lod();
             }
             return;
         }
+        // A server's far terrain is what was seen there, whatever the setting.
+        let local = self.remote.is_none() || self.integrated.is_some();
+        let existing = local
+            && self.settings.horizon.far_source == horizon_client::graphics::FarSource::Existing;
         if self.lod_source_attempted {
-            return;
+            if self.lod_existing == existing {
+                return;
+            }
+            self.clear_lod();
         }
         self.lod_source_attempted = true;
+        self.lod_existing = existing;
         let source = match &self.integrated {
+            Some(server) if existing => server.call(|game| game.existing_lod_source()).flatten(),
             Some(server) => server.call(|game| game.streaming.lod_source()),
+            None if self.remote.is_some() => self.remote_lod_source(),
+            None if existing => self.existing_lod_source(),
             None => Some(self.streaming.lod_source()),
         };
         if let Some(source) = source {
@@ -12868,6 +12885,72 @@ impl Game<'_> {
             ));
             self.lod_observe.extend(self.world.chunks.keys().copied());
         }
+    }
+    /// A server's far terrain: the chunks seen there, kept on disk per server
+    /// and dimension (`lod::store`), as there is no generator to sample.
+    fn remote_lod_source(&self) -> Option<Arc<dyn horizon_client::streaming::LodSource>> {
+        use horizon_client::lod::store;
+        let server = self.lod_server.as_deref()?;
+        let folder = |name: &str| -> String {
+            name.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let root = horizon_client::logging::game_home()
+            .join("lod")
+            .join(folder(&server.to_ascii_lowercase()))
+            .join(folder(self.dim.id()));
+        match store::LodStore::open(root, self.lod_fingerprint()) {
+            Ok(store) => Some(Arc::new(store::StoreSource {
+                store,
+                import: None,
+            })),
+            Err(e) => {
+                log::warn!("Horizon: far terrain can't keep this server's chunks: {e}");
+                None
+            }
+        }
+    }
+    /// A local world's far terrain from existing chunks only (Far Terrain:
+    /// Existing Chunks), as Voxy draws: the saved region files, imported
+    /// once into the dimension's `horizon-lod` folder, and every chunk
+    /// loaded since. Nothing is generated for it.
+    fn existing_lod_source(&self) -> Option<Arc<dyn horizon_client::streaming::LodSource>> {
+        use horizon_client::lod::store;
+        let root = self.save.root.join("horizon-lod");
+        match store::LodStore::open(root, self.lod_fingerprint()) {
+            Ok(store) => Some(Arc::new(store::StoreSource {
+                store,
+                import: Some(Arc::new(horizon_client::save::SavedRegions {
+                    save: self.save.clone(),
+                    assets: self.pack.assets.clone(),
+                    biomes: self.res.biomes().clone(),
+                })),
+            })),
+            Err(e) => {
+                log::warn!("Horizon: far terrain can't keep this world's chunks: {e}");
+                None
+            }
+        }
+    }
+    /// The block state and biome tables far terrain's stores index
+    /// (`lod::store::fingerprint`).
+    fn lod_fingerprint(&self) -> u64 {
+        let facts = self.res.facts();
+        horizon_client::lod::store::fingerprint(
+            facts.states.iter().map(|state| &*state.name),
+            self.res
+                .biomes()
+                .index
+                .iter()
+                .map(|(name, &id)| (name.as_str(), id)),
+        )
     }
     fn update_world(&mut self) {
         if let Err(e) = self.poll_remote() {
@@ -12905,10 +12988,20 @@ impl Game<'_> {
             }
             // Unloaded columns first (their summaries are all that remains),
             // then a few resident ones (an edit copies a chunk the worker
-            // still holds). The worker summarizes them.
+            // still holds). The worker summarizes them. A server's far
+            // terrain keeps what it is handed (`Lod::keeps`): all of them at
+            // once, so that what the player saw is kept even if they leave
+            // before the worker gets to it.
             horizon_client::spans::time("lod_observe", || {
                 for chunk in &unloaded {
                     lod.observe(chunk.clone(), self.res.facts());
+                }
+                if lod.keeps() {
+                    for key in std::mem::take(&mut self.lod_observe) {
+                        if let Some(chunk) = self.world.chunks.get(&key) {
+                            lod.observe(chunk.clone(), self.res.facts());
+                        }
+                    }
                 }
                 while lod.observing() < horizon_client::lod::OBSERVE_AHEAD
                     && let Some(&key) = self.lod_observe.iter().next()
@@ -14246,6 +14339,8 @@ impl<'a> Game<'a> {
             lod: None,
             lod_source_attempted: false,
             far_beacons: HashMap::new(),
+            lod_server: None,
+            lod_existing: false,
             lod_observe: Default::default(),
             lod_covered_at: None,
             options,
